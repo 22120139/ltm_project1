@@ -18,88 +18,9 @@
 #define NUM_CONNECTIONS 4
 
 std::mutex file_mutex;
-
-// void download_chunk(const std::string &filename, long offset, long chunk_size, int part) {
-//     int sock = socket(AF_INET, SOCK_DGRAM, 0);
-//     if (sock < 0) {
-//         perror("Socket creation failed");
-//         return;
-//     }
-
-//     // struct timeval tv;
-//     // tv.tv_sec = 20;  // Timeout sau 5 giây
-//     // tv.tv_usec = 0;
-
-//     // setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-
-//     // std::cout << "Đã đặt timeout cho socket" << std::endl;
-
-//     sockaddr_in server_addr = {AF_INET, htons(PORT)};
-//     inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr);
-
-//     // Gửi yêu cầu tải chunk
-//     std::ostringstream request;
-//     request << "DOWNLOAD " << filename << " " << offset << " " << chunk_size;
-
-//     std::cout << "[Client] Requesting: " << filename 
-//               << " from offset " << offset 
-//               << " (chunk size: " << chunk_size << " bytes)" << std::endl;
-
-//     std::cout << "[Debug] Gửi yêu cầu: " << request.str() << std::endl;
-
-//     ssize_t sent_bytes = sendto(sock, request.str().c_str(), request.str().size(), 0, 
-//                                 (struct sockaddr *)&server_addr, sizeof(server_addr));
-
-//     if (sent_bytes < 0) {
-//         perror("sendto failed");
-//         close(sock);
-//         return;
-//     }
-
-//     // Nhận và ghi dữ liệu theo từng gói nhỏ
-//     std::ofstream file(filename + ".part" + std::to_string(part), std::ios::binary);
-//     char buffer[PAYLOAD_SIZE + 8]; // 8 bytes header chứa offset
-//     long received_bytes = 0;
-
-//     while (received_bytes < chunk_size) {
-//         std::cout << "[Debug] Đang chờ dữ liệu từ server..." << std::endl;
-//         ssize_t recv_bytes = recvfrom(sock, buffer, sizeof(buffer), 0, NULL, NULL);
-//         std::cout << "[Debug] Nhận được " << recv_bytes << " bytes" << std::endl;
-//         if (recv_bytes <= 8) {
-//             std::cerr << "[Error] Không nhận được dữ liệu hoặc gói tin quá nhỏ cho part " << part << std::endl;
-//             break;
-//         }
-
-//         // Đọc offset từ gói tin
-//         long received_offset;
-//         memcpy(&received_offset, buffer, sizeof(long));
-
-//         // Debug offset nhận được
-//         std::cout << "[Debug] Nhận offset: " << received_offset 
-//                   << ", yêu cầu offset trong khoảng [" << offset << ", " << offset + chunk_size << "]" 
-//                   << ", kích thước gói: " << recv_bytes << " bytes" << std::endl;
-
-//         // Nếu offset không hợp lệ, bỏ qua gói tin nhưng tiếp tục nhận các gói khác
-//         if (received_offset < offset || received_offset >= offset + chunk_size) {
-//             std::cerr << "[Warning] Offset không hợp lệ, bỏ qua gói tin!" << std::endl;
-//             continue;
-//         }
-
-//         // Ghi dữ liệu (bỏ qua header)
-//         file.write(buffer + 8, recv_bytes - 8);
-//         received_bytes += (recv_bytes - 8);
-//     }
-
-//     file.close();
-//     close(sock);
-
-//     if (received_bytes == 0) {
-//         std::cerr << "[Warning] Không nhận được dữ liệu hợp lệ cho part " << part << std::endl;
-//     }
-
-//     std::cout << "[Client] Downloaded " << filename << " part " << part 
-//               << " (" << received_bytes << " bytes)" << std::endl;
-// }
+std::mutex progress_mutex;
+long total_downloaded = 0;
+long file_total_size = 1;  // Tránh chia cho 0
 
 void download_chunk(const std::string &filename, long start_offset, long end_offset, int thread_id) {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -115,8 +36,9 @@ void download_chunk(const std::string &filename, long start_offset, long end_off
     char buffer[PAYLOAD_SIZE + 8]; // 8 bytes header chứa offset
     long received_bytes = 0;
 
-    for (long offset = start_offset; offset < end_offset; offset += PAYLOAD_SIZE) {
-        long send_size = std::min((long)PAYLOAD_SIZE, end_offset - offset);
+    long send_size = std::min((long)PAYLOAD_SIZE, end_offset - start_offset); // Xác định kích thước trước
+    for (long offset = start_offset; offset < end_offset; offset += send_size) {
+        send_size = std::min((long)PAYLOAD_SIZE, end_offset - offset);
 
         std::ostringstream request;
         request << "DOWNLOAD " << filename << " " << offset << " " << send_size;
@@ -151,6 +73,11 @@ void download_chunk(const std::string &filename, long start_offset, long end_off
         // Ghi dữ liệu vào file (bỏ qua phần header 8 byte)
         file.write(buffer + 8, recv_bytes - 8);
         received_bytes += (recv_bytes - 8);
+
+        std::lock_guard<std::mutex> lock(progress_mutex);
+        total_downloaded += (recv_bytes - 8);
+        double progress = std::min(100.0, (total_downloaded * 100.0) / file_total_size);
+        std::cout << "\r[Progress] Downloading: " << progress << "%  " << std::flush;
     }
 
     file.close();
@@ -202,21 +129,9 @@ void merge_file(const std::string &filename) {
     std::cout << "[Debug] File merge hoàn tất: " << filename + "_merged" << std::endl;
 }
 
-
-// void download_file(const std::string &filename, long file_size) {
-//     long chunk_size = file_size / NUM_CONNECTIONS;
-//     std::vector<std::thread> threads;
-
-//     for (int i = 0; i < NUM_CONNECTIONS; i++) {
-//         threads.emplace_back(download_chunk, filename, i * chunk_size, chunk_size, i);
-//     }
-//     for (auto &t : threads) t.join();
-
-//     std::cout << "[Debug] Tất cả luồng đã kết thúc, chuẩn bị merge file..." << std::endl;
-//     merge_file(filename);
-// }
-
 void download_file(const std::string &filename, long file_size) {
+    file_total_size = file_size;  // Gán kích thước tổng
+
     long chunk_per_thread = file_size / NUM_CONNECTIONS;  // Mỗi thread xử lý phần này
     std::vector<std::thread> threads;
 
@@ -234,11 +149,72 @@ void download_file(const std::string &filename, long file_size) {
     merge_file(filename);
 }
 
+void request_file_list() {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        perror("[ERROR] Socket creation failed");
+        return;
+    }
+
+    sockaddr_in server_addr = {};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(PORT);
+    inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr);
+
+    std::string request = "LIST";
+    sendto(sock, request.c_str(), request.size(), 0, (struct sockaddr *)&server_addr, sizeof(server_addr));
+
+    char buffer[4096];
+    ssize_t recv_bytes = recvfrom(sock, buffer, sizeof(buffer) - 1, 0, NULL, NULL);
+    if (recv_bytes > 0) {
+        buffer[recv_bytes] = '\0';
+        std::cout << "[File List]\n" << buffer;
+    } else {
+        std::cerr << "[ERROR] Failed to receive file list" << std::endl;
+    }
+
+    close(sock);
+}
+
+long get_file_size(const std::string &filename) {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        perror("[ERROR] Socket creation failed");
+        return -1;
+    }
+
+    sockaddr_in server_addr = {};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(PORT);
+    inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr);
+
+    std::string request = "SIZE " + filename;
+    sendto(sock, request.c_str(), request.size(), 0, (struct sockaddr *)&server_addr, sizeof(server_addr));
+
+    char buffer[64];
+    ssize_t recv_bytes = recvfrom(sock, buffer, sizeof(buffer) - 1, 0, NULL, NULL);
+    close(sock);
+
+    if (recv_bytes <= 0) {
+        std::cerr << "[ERROR] Không thể lấy kích thước file từ server\n";
+        return -1;
+    }
+
+    buffer[recv_bytes] = '\0';
+    return std::stol(buffer); // Chuyển đổi kích thước file từ string sang long
+}
+
 int main() {
+    request_file_list();  // Yêu cầu danh sách file từ server
     std::ifstream input_file("input.txt");
     std::string filename;
     
     while (std::getline(input_file, filename)) {
-        download_file(filename, 1024 * 1024);  // Giả sử file 1MB
+        long file_size = get_file_size(filename);
+        if (file_size > 0) {
+            download_file(filename, file_size);
+        } else {
+            std::cerr << "[ERROR] Không thể tải file: " << filename << std::endl;
+        }
     }
 }
