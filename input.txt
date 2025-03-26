@@ -1,2 +1,1 @@
-server.c
-gistfile1.txt
+100MB.bin

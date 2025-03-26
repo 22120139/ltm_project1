@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <dirent.h>  // Thư viện để liệt kê file trong thư mục
 #include <sys/stat.h>  // Để lấy kích thước file
+#include <zlib.h>  // Thư viện hỗ trợ CRC32
 
 #define PORT 8080
 #define HEADER_SIZE 10  
@@ -91,6 +92,12 @@ void send_file_list(int sock, sockaddr_in client_addr, socklen_t addr_len) {
     std::cout << "[INFO] Sent file list to client.\n";
 }
 
+std::string calculate_checksum(const char *data, size_t length) {
+    uLong crc = crc32(0L, Z_NULL, 0);  // Khởi tạo CRC
+    crc = crc32(crc, reinterpret_cast<const Bytef *>(data), length);
+    return std::string(reinterpret_cast<const char *>(&crc), sizeof(crc));
+}
+
 void handle_client(int sock, sockaddr_in client_addr, socklen_t addr_len) {
     char request[1024];
     ssize_t recv_bytes = recvfrom(sock, request, sizeof(request) - 1, 0, (struct sockaddr *)&client_addr, &addr_len);
@@ -143,7 +150,7 @@ void handle_client(int sock, sockaddr_in client_addr, socklen_t addr_len) {
         std::cout << "[DEBUG] Chunk size: " << chunk_size << " bytes\n";
 
         // Cấp phát buffer động
-        long buffer_size = chunk_size + sizeof(int64_t);
+        long buffer_size = chunk_size + sizeof(int64_t) + 4;  // 4 bytes cho checksum
         char *buffer = new char[buffer_size];
 
         // Ghi offset vào đầu buffer
@@ -160,10 +167,26 @@ void handle_client(int sock, sockaddr_in client_addr, socklen_t addr_len) {
             return;
         }
 
-        std::cout << "[DEBUG] Sending " << bytes_read << " bytes to client\n";
+        // Tính checksum cho phần dữ liệu
+        std::string checksum = calculate_checksum(buffer + sizeof(int64_t) + 4, bytes_read);
+
+        // Ghi checksum vào buffer (4 byte sau offset)
+        memcpy(buffer + sizeof(int64_t), checksum.data(), 4);
 
         // Gửi dữ liệu tới client
-        sendto(sock, buffer, bytes_read + sizeof(int64_t), 0, (struct sockaddr *)&client_addr, addr_len);
+        sendto(sock, buffer, buffer_size, 0, (struct sockaddr *)&client_addr, addr_len);
+
+        std::cout << "[DEBUG] Sent " << bytes_read << " bytes + checksum to client\n";
+
+        // Chờ nhận ACK từ client
+        long ack_offset;
+        ssize_t ack_bytes = recvfrom(sock, &ack_offset, sizeof(long), 0, (struct sockaddr *)&client_addr, &addr_len);
+
+        if (ack_bytes <= 0 || ack_offset != offset) {
+            std::cerr << "[ERROR] ACK không hợp lệ hoặc không nhận được từ client\n";
+        } else {
+            std::cout << "[DEBUG] Received ACK for offset: " << ack_offset << "\n";
+        }
 
         // Giải phóng bộ nhớ
         delete[] buffer;

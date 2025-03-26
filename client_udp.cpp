@@ -10,17 +10,27 @@
 #include <unistd.h>
 #include <cstring>
 #include <sys/time.h>
+#include <openssl/sha.h>  // Thư viện OpenSSL để tính checksum
+#include <zlib.h>  // Thư viện hỗ trợ CRC32
 
 #define PORT 8080
 #define SERVER_IP "127.0.0.1"
 #define CHUNK_SIZE 65536        // 64 KB
 #define PAYLOAD_SIZE 1400       // UDP payload an toàn (MTU 1500 - header)
 #define NUM_CONNECTIONS 4
+#define RETRY_LIMIT 5
 
 std::mutex file_mutex;
 std::mutex progress_mutex;
 long total_downloaded = 0;
 long file_total_size = 1;  // Tránh chia cho 0
+
+std::string calculate_checksum(const char *data, size_t len) {
+    uLong crc = crc32(0L, Z_NULL, 0);  // Khởi tạo CRC
+    crc = crc32(crc, reinterpret_cast<const Bytef *>(data), len);
+
+    return std::string(reinterpret_cast<const char *>(&crc), sizeof(crc)); // 4 byte CRC32
+}
 
 void download_chunk(const std::string &filename, long start_offset, long end_offset, int thread_id) {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -33,51 +43,95 @@ void download_chunk(const std::string &filename, long start_offset, long end_off
     inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr);
 
     std::ofstream file(filename + ".part" + std::to_string(thread_id), std::ios::binary);
-    char buffer[PAYLOAD_SIZE + 8]; // 8 bytes header chứa offset
+    char buffer[PAYLOAD_SIZE + 12]; // 8 bytes offset + 4 bytes checksum
     long received_bytes = 0;
 
-    long send_size = std::min((long)PAYLOAD_SIZE, end_offset - start_offset); // Xác định kích thước trước
+    long send_size = std::min((long)PAYLOAD_SIZE, end_offset - start_offset);
     for (long offset = start_offset; offset < end_offset; offset += send_size) {
         send_size = std::min((long)PAYLOAD_SIZE, end_offset - offset);
+        int retries = 0;
+        bool success = false;
 
-        std::ostringstream request;
-        request << "DOWNLOAD " << filename << " " << offset << " " << send_size;
+        while (retries < RETRY_LIMIT) {
+            // Gửi yêu cầu tải chunk
+            std::ostringstream request;
+            request << "DOWNLOAD " << filename << " " << offset << " " << send_size;
 
-        std::cout << "[Thread " << thread_id << "] Requesting: " << filename
-                  << " from offset " << offset << " (chunk size: " << send_size << " bytes)" << std::endl;
+            std::cout << "[Thread " << thread_id << "] Requesting chunk at offset: " << offset 
+                      << " (size: " << send_size << " bytes)\n";
 
-        ssize_t sent_bytes = sendto(sock, request.str().c_str(), request.str().size(), 0, 
-                                    (struct sockaddr *)&server_addr, sizeof(server_addr));
+            ssize_t sent_bytes = sendto(sock, request.str().c_str(), request.str().size(), 0, 
+                                        (struct sockaddr *)&server_addr, sizeof(server_addr));
 
-        if (sent_bytes < 0) {
-            perror("[Error] sendto failed");
-            continue;
+            if (sent_bytes < 0) {
+                perror("[Error] sendto failed");
+                retries++;
+                continue;
+            }
+
+            // Chờ nhận dữ liệu
+            struct timeval timeout = {2, 0};  // 2 giây timeout
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+            sockaddr_in from_addr;
+            socklen_t addr_len = sizeof(from_addr);
+            ssize_t recv_bytes = recvfrom(sock, buffer, sizeof(buffer), 0, 
+                                          (struct sockaddr *)&from_addr, &addr_len);
+
+            if (recv_bytes < 12) {  // Gói tin quá nhỏ, có thể bị lỗi
+                std::cerr << "[Error] Không nhận được dữ liệu hoặc gói tin quá nhỏ, thử lại...\n";
+                retries++;
+                continue;
+            }
+
+            // Đọc offset từ gói tin
+            long received_offset;
+            memcpy(&received_offset, buffer, sizeof(long));
+
+            if (received_offset != offset) {
+                std::cerr << "[Warning] Offset không khớp! Nhận " << received_offset 
+                          << " nhưng mong đợi " << offset << ". Thử lại...\n";
+                retries++;
+                continue;
+            }
+
+            // Đọc checksum
+            std::string received_checksum(buffer + 8, 4);
+            std::string computed_checksum = calculate_checksum(buffer + 12, recv_bytes - 12);
+
+            if (memcmp(received_checksum.data(), computed_checksum.data(), 4) != 0) {
+                std::cerr << "[Error] Checksum không khớp! Thử lại...\n";
+                retries++;
+                continue;
+            }
+
+            // Ghi dữ liệu vào file (bỏ qua phần header 12 byte)
+            file.write(buffer + 12, recv_bytes - 12);
+            received_bytes += (recv_bytes - 12);
+
+            // Gửi ACK sau khi kiểm tra dữ liệu hợp lệ
+            std::cout << "[DEBUG] Gửi ACK cho offset: " << offset << "\n";
+            ssize_t ack_sent = sendto(sock, &offset, sizeof(long), 0, 
+                                      (struct sockaddr *)&server_addr, sizeof(server_addr));
+
+            if (ack_sent < 0) {
+                perror("[Error] sendto ACK failed");
+            }
+
+            // Cập nhật tiến trình tải
+            std::lock_guard<std::mutex> lock(progress_mutex);
+            total_downloaded += (recv_bytes - 12);
+            double progress = std::min(100.0, (total_downloaded * 100.0) / file_total_size);
+            std::cout << "\r[Progress] Downloading: " << progress << "%  " << std::flush;
+
+            success = true;
+            break; // Chunk đã tải xong, thoát vòng lặp retry
         }
 
-        // Nhận dữ liệu
-        ssize_t recv_bytes = recvfrom(sock, buffer, sizeof(buffer), 0, NULL, NULL);
-        if (recv_bytes <= 8) {
-            std::cerr << "[Error] Không nhận được dữ liệu hoặc gói tin quá nhỏ\n";
-            continue;
+        if (!success) {
+            std::cerr << "[Thread " << thread_id << "] Lỗi tải chunk " << offset << " sau " 
+                      << RETRY_LIMIT << " lần thử.\n";
         }
-
-        // Đọc offset từ gói tin
-        long received_offset;
-        memcpy(&received_offset, buffer, sizeof(long));
-
-        if (received_offset != offset) {
-            std::cerr << "[Warning] Offset không khớp! Bỏ qua gói tin.\n";
-            continue;
-        }
-
-        // Ghi dữ liệu vào file (bỏ qua phần header 8 byte)
-        file.write(buffer + 8, recv_bytes - 8);
-        received_bytes += (recv_bytes - 8);
-
-        std::lock_guard<std::mutex> lock(progress_mutex);
-        total_downloaded += (recv_bytes - 8);
-        double progress = std::min(100.0, (total_downloaded * 100.0) / file_total_size);
-        std::cout << "\r[Progress] Downloading: " << progress << "%  " << std::flush;
     }
 
     file.close();
@@ -87,7 +141,6 @@ void download_chunk(const std::string &filename, long start_offset, long end_off
               << filename << " part " << thread_id 
               << " (" << received_bytes << " bytes)" << std::endl;
 }
-
 
 void merge_file(const std::string &filename) {
     std::ofstream outfile(filename + "_merged", std::ios::binary);
