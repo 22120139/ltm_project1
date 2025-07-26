@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <csignal>
 #include <set>
+#include <iomanip>
 
 #define PORT 8080
 #define PAYLOAD_SIZE 1024
@@ -28,6 +29,9 @@ std::mutex file_mutex;
 std::mutex progress_mutex;
 long file_total_size = 1;
 long total_downloaded = 0;
+std::vector<long> chunk_downloaded(NUM_CONNECTIONS, 0);
+std::vector<long> chunk_size(NUM_CONNECTIONS, 0);
+
 
 std::string calculate_checksum(const char *data, size_t len) {
     uLong crc = crc32(0L, Z_NULL, 0);
@@ -115,7 +119,8 @@ void download_chunk(const std::string &filename, long start_offset, long end_off
         ssize_t recv_bytes = 0;
 
         std::ostringstream request;
-        request << "DOWNLOAD " << filename << " " << offset << " " << send_size;
+        request << "DOWNLOAD " << filename << " " << offset << " " << send_size 
+                << " " << thread_id;
 
         if (retry_with_backoff(sock, request.str(), server_addr, buffer, sizeof(buffer), 
                               offset, retry_count, recv_bytes)) {
@@ -123,19 +128,28 @@ void download_chunk(const std::string &filename, long start_offset, long end_off
             file.write(buffer + 12, recv_bytes - 12);
 
             // Gửi ACK
-            ssize_t ack_sent = sendto(sock, &offset, sizeof(long), 0,
-                                     (struct sockaddr *)&server_addr, sizeof(server_addr));
-            if (ack_sent < 0) {
-                perror("[Error] sendto ACK failed");
-            }
+           std::ostringstream oss;
+            oss << "ACK " << offset << " " << thread_id;
+
+            std::string ack_msg = oss.str();
+
+            ssize_t ack_sent = sendto(sock, ack_msg.c_str(), ack_msg.size(), 0,
+                                    (struct sockaddr *)&server_addr, sizeof(server_addr));
 
             // Cập nhật tiến trình
             {
                 std::lock_guard<std::mutex> lock(progress_mutex);
-                total_downloaded += (recv_bytes - 12);
-                double progress = std::min(100.0, (total_downloaded * 100.0) / file_total_size);
-                std::cout << "\r[Progress] Downloading: " << progress << "%  " << std::flush;
+                chunk_downloaded[thread_id] += (recv_bytes - 12); // chỉ cộng dữ liệu thật
+                double percent = (chunk_downloaded[thread_id] * 100.0) / chunk_size[thread_id];
+
+                std::cout << "\r";
+                for (int j = 0; j < NUM_CONNECTIONS; ++j) {
+                    double p = (chunk_downloaded[j] * 100.0) / chunk_size[j];
+                    std::cout << "[Part " << j << ": " << std::setw(6) << std::fixed << std::setprecision(2) << p << "%] ";
+                }
+                std::cout << std::flush;
             }
+
 
             offset += send_size;
         } else {
@@ -216,6 +230,7 @@ void download_file(const std::string &filename, long file_size, const char* serv
     for (int i = 0; i < NUM_CONNECTIONS; i++) {
         long start_offset = i * chunk_per_thread;
         long end_offset = (i == NUM_CONNECTIONS - 1) ? file_size : start_offset + chunk_per_thread;
+        chunk_size[i] = end_offset - start_offset;
         threads.emplace_back(download_chunk, filename, start_offset, end_offset, i, server_ip);
     }
 
