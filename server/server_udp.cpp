@@ -9,10 +9,13 @@
 #include <dirent.h>  // Thư viện để liệt kê file trong thư mục
 #include <sys/stat.h>  // Để lấy kích thước file
 #include <zlib.h>  // Thư viện hỗ trợ CRC32
+#include <map>
+#include <vector>
+#include <string>
 
 #define PORT 8080
 #define HEADER_SIZE 10  
-#define MAX_CHUNK_SIZE 4096  
+#define MAX_CHUNK_SIZE 4096 
 
 uint32_t compute_crc32_of_file(const std::string& filename) {
     std::ifstream file(filename, std::ios::binary);
@@ -20,6 +23,15 @@ uint32_t compute_crc32_of_file(const std::string& filename) {
 
     std::vector<char> buffer(std::istreambuf_iterator<char>(file), {});
     return crc32(0L, reinterpret_cast<const Bytef*>(buffer.data()), buffer.size());
+}
+
+// Bộ nhớ lưu offset + chunk_id đang chờ ACK
+std::map<std::string, std::pair<long, int>> ack_waiting;
+
+std::string client_key(const sockaddr_in& addr) {
+    char ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
+    return std::string(ip) + ":" + std::to_string(ntohs(addr.sin_port));
 }
 
 // Lấy kích thước file (trả về -1 nếu lỗi)
@@ -121,6 +133,8 @@ void handle_client(int sock, sockaddr_in client_addr, socklen_t addr_len) {
     std::string command;
     iss >> command;
 
+    std::string key = client_key(client_addr);
+
     if (command == "LIST") {
         update_file_list();  // Cập nhật danh sách trước khi gửi
         std::string file_list = list_files();
@@ -130,7 +144,8 @@ void handle_client(int sock, sockaddr_in client_addr, socklen_t addr_len) {
     else if (command == "DOWNLOAD") {
         std::string filename;
         long offset, requested_chunk_size;
-        iss >> filename >> offset >> requested_chunk_size;
+        int chunk_id = -1;
+        iss >> filename >> offset >> requested_chunk_size >> chunk_id;
 
         // Mở file
         std::ifstream file(filename, std::ios::binary | std::ios::ate);
@@ -156,6 +171,7 @@ void handle_client(int sock, sockaddr_in client_addr, socklen_t addr_len) {
         std::cout << "[DEBUG] File size: " << file_size << " bytes\n";
         std::cout << "[DEBUG] Offset requested: " << offset << "\n";
         std::cout << "[DEBUG] Chunk size: " << chunk_size << " bytes\n";
+        std::cout << "[DEBUG] Request from chunk_id: " << chunk_id << "\n";
 
         // Cấp phát buffer động
         long buffer_size = chunk_size + sizeof(int64_t) + 4;  // 4 bytes cho checksum
@@ -186,19 +202,22 @@ void handle_client(int sock, sockaddr_in client_addr, socklen_t addr_len) {
 
         std::cout << "[DEBUG] Sent " << bytes_read << " bytes + checksum to client\n";
 
-        // Chờ nhận ACK từ client
-        long ack_offset;
-        ssize_t ack_bytes = recvfrom(sock, &ack_offset, sizeof(long), 0, (struct sockaddr *)&client_addr, &addr_len);
-
-        if (ack_bytes <= 0 || ack_offset != offset) {
-            std::cerr << "[ERROR] ACK không hợp lệ hoặc không nhận được từ client\n";
-        } else {
-            std::cout << "[DEBUG] Received ACK for offset: " << ack_offset << "\n";
-        }
+        ack_waiting[key] = {offset, chunk_id};
 
         // Giải phóng bộ nhớ
         delete[] buffer;
     } 
+
+    else if (strncmp(request, "CRC32 ", 6) == 0) {
+        std::string filename = request + 6;
+        uint32_t crc = compute_crc32_of_file(filename);
+
+        // Gửi CRC dưới dạng chuỗi số
+        std::string response = std::to_string(crc);
+        sendto(sock, response.c_str(), response.size(), 0, (struct sockaddr *)&client_addr, addr_len);
+
+        std::cout << "[INFO] Sent CRC32 of file " << filename << ": " << crc << "\n";
+    }
 
     else if (strncmp(request, "SIZE ", 5) == 0) {
         std::string filename = request + 5;  // Lấy tên file từ chuỗi request
@@ -213,15 +232,26 @@ void handle_client(int sock, sockaddr_in client_addr, socklen_t addr_len) {
             sendto(sock, response.c_str(), response.size(), 0, (struct sockaddr *)&client_addr, addr_len);
         }
     }
-    else if (strncmp(request, "CRC32 ", 6) == 0) {
-        std::string filename = request + 6;
-        uint32_t crc = compute_crc32_of_file(filename);
 
-        // Gửi CRC dưới dạng chuỗi số
-        std::string response = std::to_string(crc);
-        sendto(sock, response.c_str(), response.size(), 0, (struct sockaddr *)&client_addr, addr_len);
+    else if (command == "ACK") {
+        long ack_offset;
+        int ack_chunk;
+        iss >> ack_offset >> ack_chunk;
 
-        std::cout << "[INFO] Sent CRC32 of file " << filename << ": " << crc << "\n";
+        std::cout << "[DEBUG] Received ACK " << ack_offset << " chunk " << ack_chunk << " from " << key << "\n";
+
+        auto it = ack_waiting.find(key);
+        if (it != ack_waiting.end()) {
+            if (it->second.first == ack_offset && it->second.second == ack_chunk) {
+                std::cout << "[DEBUG] Valid ACK from " << key << " for offset " << ack_offset << ", chunk " << ack_chunk << "\n";
+                ack_waiting.erase(it);
+            } else {
+                std::cerr << "[ERROR] Invalid ACK from " << key << ". Expected offset "
+                          << it->second.first << ", chunk " << it->second.second << "\n";
+            }
+        } else {
+            std::cerr << "[ERROR] ACK from " << key << " but no pending download found\n";
+        }
     }
 
     else {

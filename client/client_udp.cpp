@@ -32,6 +32,26 @@ long total_downloaded = 0;
 std::vector<long> chunk_downloaded(NUM_CONNECTIONS, 0);
 std::vector<long> chunk_size(NUM_CONNECTIONS, 0);
 
+std::string request_crc32(const std::string &filename, const char* server_ip) {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) return "";
+
+    sockaddr_in server_addr = {};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(PORT);
+    inet_pton(AF_INET, server_ip, &server_addr.sin_addr);
+
+    std::string request = "CRC32 " + filename;
+    sendto(sock, request.c_str(), request.size(), 0, (struct sockaddr*)&server_addr, sizeof(server_addr));
+
+    char buffer[64];
+    ssize_t len = recvfrom(sock, buffer, sizeof(buffer)-1, 0, NULL, NULL);
+    close(sock);
+
+    if (len <= 0) return "";
+    buffer[len] = '\0';
+    return std::string(buffer);
+}
 std::string compute_crc32_of_file(const std::string &filepath) {
     std::ifstream file(filepath, std::ios::binary);
     if (!file) return "";
@@ -45,9 +65,8 @@ std::string compute_crc32_of_file(const std::string &filepath) {
         crc = crc32(crc, reinterpret_cast<const Bytef *>(buffer), file.gcount());
     }
 
-    char crc_hex[16];
-    sprintf(crc_hex, "%08lx", crc);
-    return std::string(crc_hex);
+    // Trả về CRC32 dưới dạng chuỗi thập phân
+    return std::to_string(static_cast<uint32_t>(crc));
 }
 
 std::string calculate_checksum(const char *data, size_t len) {
@@ -201,13 +220,13 @@ std::string get_unique_filename(const std::string &filename) {
     return unique_filename;
 }
 
-void merge_file(const std::string &filename) {
+std::string merge_file(const std::string &filename) {
     std::string merged_filename = get_unique_filename(filename);
     std::ofstream outfile(merged_filename, std::ios::binary);
 
     if (!outfile) {
         std::cerr << "[Error] Không thể tạo file merge: " << merged_filename << std::endl;
-        return;
+        return "";
     }
 
     // Merge các phần chính
@@ -237,6 +256,7 @@ void merge_file(const std::string &filename) {
 
     outfile.close();
     std::cout << "[Info] Đã merge file: " << merged_filename << std::endl;
+    return merged_filename;
 }
 
 void download_file(const std::string &filename, long file_size, const char* server_ip) {
@@ -287,9 +307,14 @@ void download_file(const std::string &filename, long file_size, const char* serv
     }
 
     std::cout << "[Info] Merge file...\n";
-    merge_file(filename);
-    std::string local_file = get_unique_filename(filename); // Same logic as merge_file
-    std::string local_crc = compute_crc32_of_file(local_file);
+    std::string merged_file = merge_file(filename);
+
+    if (merged_file.empty()) {
+        std::cerr << "[X] Merge thất bại. Không thể kiểm tra CRC32.\n";
+        return;
+    }
+
+    std::string local_crc = compute_crc32_of_file(merged_file);
     std::string server_crc = request_crc32(filename, server_ip);
 
     if (local_crc == server_crc) {
