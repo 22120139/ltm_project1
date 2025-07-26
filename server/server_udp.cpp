@@ -213,6 +213,16 @@ void handle_client(int sock, sockaddr_in client_addr, socklen_t addr_len) {
             sendto(sock, response.c_str(), response.size(), 0, (struct sockaddr *)&client_addr, addr_len);
         }
     }
+    else if (strncmp(request, "CRC32 ", 6) == 0) {
+        std::string filename = request + 6;
+        uint32_t crc = compute_crc32_of_file(filename);
+
+        // Gửi CRC dưới dạng chuỗi số
+        std::string response = std::to_string(crc);
+        sendto(sock, response.c_str(), response.size(), 0, (struct sockaddr *)&client_addr, addr_len);
+
+        std::cout << "[INFO] Sent CRC32 of file " << filename << ": " << crc << "\n";
+    }
 
     else {
         std::cerr << "[ERROR] Invalid command: " << command << "\n";
