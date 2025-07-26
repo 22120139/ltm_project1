@@ -1,3 +1,4 @@
 50MB_file.txt
 10MB_file.txt
 10MB_file.txt
+5mb.zip

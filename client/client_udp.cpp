@@ -224,6 +224,13 @@ void merge_file(const std::string &filename) {
 
 void download_file(const std::string &filename, long file_size, const char* server_ip) {
     file_total_size = file_size;
+
+    // RESET lại dữ liệu trước mỗi lần tải file mới
+    for (int i = 0; i < NUM_CONNECTIONS; ++i) {
+        chunk_downloaded[i] = 0;
+        chunk_size[i] = 0;
+    }
+
     long chunk_per_thread = file_size / NUM_CONNECTIONS;
     std::vector<std::thread> threads;
 
@@ -236,48 +243,34 @@ void download_file(const std::string &filename, long file_size, const char* serv
 
     for (auto &t : threads) t.join();
 
-    // After all threads complete and before merging:
-    // Ensure the progress line is cleared before printing new messages.
     {
         std::lock_guard<std::mutex> lock(progress_mutex);
-        std::cout << "\r" << std::string(80, ' ') << "\r"; // Clear the current line (e.g., 80 spaces)
+        std::cout << "\r" << std::string(80, ' ') << "\r";
         std::cout.flush();
     }
 
-    // Sau merge_file(filename);
     std::ifstream failed_log("failed_chunks_" + filename + ".log");
     if (failed_log) {
-        std::cout << "[!] Phát hiện phần bị lỗi. Bạn có muốn thử tải lại? (y/n): ";
+        std::cout << "[!] Phat hien phan loi. Tai lai? (y/n): ";
         char ch;
         std::cin >> ch;
         if (ch == 'y' || ch == 'Y') {
             long offset, size;
             while (failed_log >> offset >> size) {
-                // Clear the line again before starting retry download progress
                 {
                     std::lock_guard<std::mutex> lock(progress_mutex);
                     std::cout << "\r" << std::string(80, ' ') << "\r";
                     std::cout.flush();
                 }
-                download_chunk(filename, offset, offset + size, 999, server_ip); // 999 là thread_id tạm
+                download_chunk(filename, offset, offset + size, 999, server_ip);
             }
             failed_log.close();
             remove(("failed_chunks_" + filename + ".log").c_str());
-            
-            // Clear the line once more after retry attempts, before merging again
-            {
-                std::lock_guard<std::mutex> lock(progress_mutex);
-                std::cout << "\r" << std::string(80, ' ') << "\r";
-                std::cout.flush();
-            }
-            merge_file(filename); // Merge lại
         }
     }
-    else {
-            std::cout << "[Info] Hoàn tất tải. Đang tiến hành merge...\n";
-            merge_file(filename);
-    }
-    total_downloaded = 0;
+
+    std::cout << "[Info] Merge file...\n";
+    merge_file(filename);
 }
 
 void request_file_list(const char* server_ip) {
