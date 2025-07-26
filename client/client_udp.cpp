@@ -22,7 +22,7 @@
 #define NUM_CONNECTIONS 4
 #define INITIAL_RETRY_DELAY_MS 100  // 100ms cho lần retry đầu tiên
 #define MAX_RETRY_DELAY_MS 2000     // Tối đa 2s giữa các lần retry
-#define MAX_RETRIES 15   
+#define MAX_RETRIES 30  
 
 std::mutex file_mutex;
 std::mutex progress_mutex;
@@ -109,14 +109,6 @@ void download_chunk(const std::string &filename, long start_offset, long end_off
     std::ofstream file(part_filename, std::ios::binary);
     char buffer[PAYLOAD_SIZE + 12];
 
-    // Debug: Thông báo bắt đầu tải
-    {
-        std::lock_guard<std::mutex> lock(progress_mutex);
-        std::cout << "[DEBUG] Thread " << thread_id << " bắt đầu tải file: " << filename 
-                  << " (part " << thread_id << ") từ offset " << start_offset 
-                  << " đến " << end_offset << std::endl;
-    }
-
     for (long offset = start_offset; offset < end_offset;) {
         long send_size = std::min((long)PAYLOAD_SIZE, end_offset - offset);
         int retry_count = 0;
@@ -125,20 +117,8 @@ void download_chunk(const std::string &filename, long start_offset, long end_off
         std::ostringstream request;
         request << "DOWNLOAD " << filename << " " << offset << " " << send_size;
 
-        // Debug: Thông báo gửi request
-        {
-            std::lock_guard<std::mutex> lock(progress_mutex);
-            std::cout << "[DEBUG] Thread " << thread_id << " gửi request: " << request.str() << std::endl;
-        }
-
         if (retry_with_backoff(sock, request.str(), server_addr, buffer, sizeof(buffer), 
                               offset, retry_count, recv_bytes)) {
-            // Debug: Thông báo nhận dữ liệu thành công
-            {
-                std::lock_guard<std::mutex> lock(progress_mutex);
-                std::cout << "[DEBUG] Thread " << thread_id << " nhận " << recv_bytes - 12 
-                          << " bytes dữ liệu cho offset " << offset << std::endl;
-            }
 
             file.write(buffer + 12, recv_bytes - 12);
 
@@ -159,21 +139,14 @@ void download_chunk(const std::string &filename, long start_offset, long end_off
 
             offset += send_size;
         } else {
-            // Debug: Thông báo lỗi
-            {
-                std::lock_guard<std::mutex> lock(progress_mutex);
-                std::cerr << "[DEBUG] Thread " << thread_id << " LỖI tại offset " 
-                          << offset << " sau " << retry_count << " lần thử.\n";
-            }
-            offset += send_size; // Bỏ qua chunk lỗi
-        }
-    }
+                    // Ghi lại chunk lỗi
+                    std::ofstream log("failed_chunks_" + filename + ".log", std::ios::app);
+                    log << offset << " " << send_size << "\n";
+                    log.close();
 
-    // Debug: Thông báo hoàn thành
-    {
-        std::lock_guard<std::mutex> lock(progress_mutex);
-        std::cout << "[DEBUG] Thread " << thread_id << " hoàn thành tải part " << part_filename 
-                  << " kích thước: " << (end_offset - start_offset) << " bytes" << std::endl;
+                    offset += send_size; // Bỏ qua chunk lỗi
+                }
+
     }
 
     file.close();
@@ -206,6 +179,7 @@ void merge_file(const std::string &filename) {
         return;
     }
 
+    // Merge các phần chính
     for (int i = 0; i < NUM_CONNECTIONS; i++) {
         std::string part_filename = filename + ".part" + std::to_string(i);
         std::ifstream infile(part_filename, std::ios::binary);
@@ -218,6 +192,16 @@ void merge_file(const std::string &filename) {
         outfile << infile.rdbuf();
         infile.close();
         remove(part_filename.c_str());
+    }
+
+    // Merge phần tải lại (nếu có)
+    std::string retry_part = filename + ".part999";
+    std::ifstream retry_file(retry_part, std::ios::binary);
+    if (retry_file) {
+        std::cout << "[Info] Đang merge phần tải lại: " << retry_part << std::endl;
+        outfile << retry_file.rdbuf();
+        retry_file.close();
+        remove(retry_part.c_str());
     }
 
     outfile.close();
@@ -237,8 +221,47 @@ void download_file(const std::string &filename, long file_size, const char* serv
 
     for (auto &t : threads) t.join();
 
-    std::cout << "\n[Info] Hoàn tất tải. Đang tiến hành merge...\n";
-    merge_file(filename);
+    // After all threads complete and before merging:
+    // Ensure the progress line is cleared before printing new messages.
+    {
+        std::lock_guard<std::mutex> lock(progress_mutex);
+        std::cout << "\r" << std::string(80, ' ') << "\r"; // Clear the current line (e.g., 80 spaces)
+        std::cout.flush();
+    }
+
+    // Sau merge_file(filename);
+    std::ifstream failed_log("failed_chunks_" + filename + ".log");
+    if (failed_log) {
+        std::cout << "[!] Phát hiện phần bị lỗi. Bạn có muốn thử tải lại? (y/n): ";
+        char ch;
+        std::cin >> ch;
+        if (ch == 'y' || ch == 'Y') {
+            long offset, size;
+            while (failed_log >> offset >> size) {
+                // Clear the line again before starting retry download progress
+                {
+                    std::lock_guard<std::mutex> lock(progress_mutex);
+                    std::cout << "\r" << std::string(80, ' ') << "\r";
+                    std::cout.flush();
+                }
+                download_chunk(filename, offset, offset + size, 999, server_ip); // 999 là thread_id tạm
+            }
+            failed_log.close();
+            remove(("failed_chunks_" + filename + ".log").c_str());
+            
+            // Clear the line once more after retry attempts, before merging again
+            {
+                std::lock_guard<std::mutex> lock(progress_mutex);
+                std::cout << "\r" << std::string(80, ' ') << "\r";
+                std::cout.flush();
+            }
+            merge_file(filename); // Merge lại
+        }
+    }
+    else {
+            std::cout << "[Info] Hoàn tất tải. Đang tiến hành merge...\n";
+            merge_file(filename);
+    }
     total_downloaded = 0;
 }
 

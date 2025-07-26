@@ -1,4 +1,5 @@
 server_udp.cpp 0MB
 10MB_file.txt 10MB
+1GB.bin 1024MB
 server_udp 0MB
 50MB_file.txt 50MB
