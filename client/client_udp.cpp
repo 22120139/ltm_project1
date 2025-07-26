@@ -32,6 +32,23 @@ long total_downloaded = 0;
 std::vector<long> chunk_downloaded(NUM_CONNECTIONS, 0);
 std::vector<long> chunk_size(NUM_CONNECTIONS, 0);
 
+std::string compute_crc32_of_file(const std::string &filepath) {
+    std::ifstream file(filepath, std::ios::binary);
+    if (!file) return "";
+
+    uLong crc = crc32(0L, Z_NULL, 0);
+    char buffer[4096];
+    while (file.read(buffer, sizeof(buffer))) {
+        crc = crc32(crc, reinterpret_cast<const Bytef *>(buffer), file.gcount());
+    }
+    if (file.gcount() > 0) {
+        crc = crc32(crc, reinterpret_cast<const Bytef *>(buffer), file.gcount());
+    }
+
+    char crc_hex[16];
+    sprintf(crc_hex, "%08lx", crc);
+    return std::string(crc_hex);
+}
 
 std::string calculate_checksum(const char *data, size_t len) {
     uLong crc = crc32(0L, Z_NULL, 0);
@@ -271,6 +288,15 @@ void download_file(const std::string &filename, long file_size, const char* serv
 
     std::cout << "[Info] Merge file...\n";
     merge_file(filename);
+    std::string local_file = get_unique_filename(filename); // Same logic as merge_file
+    std::string local_crc = compute_crc32_of_file(local_file);
+    std::string server_crc = request_crc32(filename, server_ip);
+
+    if (local_crc == server_crc) {
+        std::cout << "[✓] Kiểm tra CRC32 thành công: " << local_crc << "\n";
+    } else {
+        std::cout << "[X] CRC32 KHÔNG TRÙNG! Local: " << local_crc << " | Server: " << server_crc << "\n";
+    }
 }
 
 void request_file_list(const char* server_ip) {

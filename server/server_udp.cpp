@@ -14,6 +14,14 @@
 #define HEADER_SIZE 10  
 #define MAX_CHUNK_SIZE 4096  
 
+uint32_t compute_crc32_of_file(const std::string& filename) {
+    std::ifstream file(filename, std::ios::binary);
+    if (!file) return 0;
+
+    std::vector<char> buffer(std::istreambuf_iterator<char>(file), {});
+    return crc32(0L, reinterpret_cast<const Bytef*>(buffer.data()), buffer.size());
+}
+
 // Lấy kích thước file (trả về -1 nếu lỗi)
 long get_file_size(const std::string &filename) {
     struct stat st;
