@@ -123,7 +123,7 @@ void download_chunk(const std::string &filename, long start_offset, long end_off
         ssize_t recv_bytes = 0;
 
         std::ostringstream request;
-        request << "DOWNLOAD " << filename << " " << offset << " " << send_size;
+        request << "DOWNLOAD " << filename << " " << offset << " " << send_size << " " << thread_id;
 
         // Debug: Thông báo gửi request
         {
@@ -143,10 +143,17 @@ void download_chunk(const std::string &filename, long start_offset, long end_off
             file.write(buffer + 12, recv_bytes - 12);
 
             // Gửi ACK
-            ssize_t ack_sent = sendto(sock, &offset, sizeof(long), 0,
-                                     (struct sockaddr *)&server_addr, sizeof(server_addr));
+            std::ostringstream oss;
+            oss << "ACK " << offset << " " << thread_id;
+
+            std::string ack_msg = oss.str();
+
+            ssize_t ack_sent = sendto(sock, ack_msg.c_str(), ack_msg.size(), 0,
+                                    (struct sockaddr *)&server_addr, sizeof(server_addr));
             if (ack_sent < 0) {
-                perror("[Error] sendto ACK failed");
+                std::cerr << "[Error] sendto ACK failed";
+            } else {
+                std::cout << "[DEBUG] Sent ACK: " << ack_msg << "\n";
             }
 
             // Cập nhật tiến trình
